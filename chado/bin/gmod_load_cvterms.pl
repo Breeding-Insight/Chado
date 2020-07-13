@@ -159,9 +159,9 @@ use Bio::Chado::Schema;
 use Try::Tiny;
 
 our ($opt_d, $opt_h, $opt_H, $opt_F, $opt_n, $opt_D, $opt_v, $opt_t, 
-     $opt_u, $opt_o, $opt_p, $opt_r, $opt_g, $opt_s);
+     $opt_u, $opt_o, $opt_p, $opt_r, $opt_g, $opt_s, $opt_a);
 
-getopts('F:d:H:o:n:vD:tp:us:r:g:')
+getopts('F:d:H:o:n:vD:tp:us:r:g:a')
     or pod2usage();
 
 my $dbhost = $opt_H;
@@ -170,6 +170,7 @@ my $pass = $opt_p;
 my $driver = $opt_d;
 my $user = $opt_r;
 my $verbose = $opt_v;
+my $append = $opt_a;
 
 my $DBPROFILE = $opt_g ;
 
@@ -204,7 +205,7 @@ my $dsn = "dbi:$driver:dbname=$dbname";
 $dsn .= ";host=$dbhost";
 $dsn .= ";port=$port";
 
-my $schema= Bio::Chado::Schema->connect($dsn, $user, $pass||'');
+my $schema= Bio::Chado::Schema->connect($dsn, $user, $pass||'', {AutoCommit => 1});
 
 if (!$schema) { die "No schema is avaiable! \n"; }
 
@@ -294,8 +295,10 @@ foreach my $new_ont(@onts) {
 	print STDERR "Getting all the terms of the new ontology...\n";
 	my (@all_file_terms) = $new_ont->get_all_terms();
 	my (@all_file_predicate_terms) = $new_ont->get_predicate_terms();
+  my (@all_root_terms) = $new_ont->get_root_terms();
 	###my (@all_file_typedefs) = $new_ont->get_all_typedefs();
 	message( "***found ".(scalar(@all_file_predicate_terms))." predicate terms!.\n", 1);
+  message( "Found ".(scalar(@all_root_terms))." root terms\n", 1);
 	message( "Retrieved ".(scalar(@all_file_terms))." terms.\n", 1);
 
 	#look at all predecate terms (Typedefs)
@@ -347,12 +350,18 @@ foreach my $new_ont(@onts) {
 	my @removed_terms = ();
 	my @novel_relationships = ();
 	my @removed_relationships = ();
+  my @matched_root_terms;
 
 	print STDERR "Determining which terms are new...\n";
 
 	FILE_INDEX: foreach my $k (keys(%file_index)) {
 	    if (!exists($db_index{$k})) {
 		if (!$file_index{$k}->name() ) { next FILE_INDEX; } #skip if term in file has no name.
+
+    # Skip if the term is a root term
+    @matched_root_terms = grep { $_->identifier() eq $file_index{$k}->identifier() } @all_root_terms;
+    if (scalar @matched_root_terms > 0) { next FILE_INDEX; }
+
 		#This happens in InterPro file - which is translated from xml to obo.
 		if ($opt_v) { print STDERR "Novel term: $k ".($file_index{$k}->name())."\n"; }
 		else { print STDERR "."; }
@@ -360,24 +369,30 @@ foreach my $new_ont(@onts) {
 		$novel_terms{$k}=$file_index{$k};
 	    }
 	}
-	print STDERR "Determine which terms are not in the file anymore...\n 
-                      These terms will be set to obsolete in the database\n";
-	foreach my $k (keys(%db_index)) { 
-	    if (!exists($file_index{$k})) { 
-		my $name = $db_index{$k}->name(); #get the name in the database 
-		message( "Term not in file: $name \n",1);
-		unless( $name =~ m/obsolete.*$opt_s:/ ) {
-		    my $ob_name = $name . " (obsolete " . $opt_s . ":" . $name . ")" ;  #add the 'obsolete' suffix
-		    $db_index{$k}->set_column(name => $ob_name );
-		    message( "**modified name for $opt_s:$name - '$ob_name' \n " , 1); 
-		}
-		$db_index{$k}->set_column(is_obsolete => 1 );
-		$db_index{$k}->update();
+  
+  if (!$append) {
+    print STDERR "Determine which terms are not in the file anymore...\n 
+                        These terms will be set to obsolete in the database\n";
+    foreach my $k (keys(%db_index)) { 
+        if (!exists($file_index{$k})) { 
+      my $name = $db_index{$k}->name(); #get the name in the database 
+      message( "Term not in file: $name \n",1);
+      unless( $name =~ m/obsolete.*$opt_s:/ ) {
+          my $ob_name = $name . " (obsolete " . $opt_s . ":" . $name . ")" ;  #add the 'obsolete' suffix
+          $db_index{$k}->set_column(name => $ob_name );
+          message( "**modified name for $opt_s:$name - '$ob_name' \n " , 1); 
+      }
+      $db_index{$k}->set_column(is_obsolete => 1 );
+      $db_index{$k}->update();
 
-		print STDERR " obsoleted term  $name!.\n";
-		push @removed_terms, $db_index{$k};
-	    }
-	}
+      print STDERR " obsoleted term  $name!.\n";
+      push @removed_terms, $db_index{$k};
+        }
+    }
+  } else {
+    print STDERR "Using append option, appending new traits onto existing ontology."
+  }
+
 	print STDERR "Inserting and updating terms...\n";
 
 	my $count = 0;
@@ -657,17 +672,23 @@ foreach my $new_ont(@onts) {
 		}
 	    }
 	}
-	print STDERR "Relationships not in the file...\n";
 
-	foreach my $k (keys(%db_relationships)) { 
-	    if (! (exists($file_relationships{$k}) && defined($file_relationships{$k})) ) { 
-		push @removed_relationships, $k;
-		message("Deleted relationship: $k... \n",1);
+  if (!$append) { 
+    print STDERR "Relationships not in the file...\n";
 
-		$db_relationships{$k}->delete();
-		print STDERR "gone.\n";
-	    }
-	}
+    foreach my $k (keys(%db_relationships)) { 
+        if (! (exists($file_relationships{$k}) && defined($file_relationships{$k})) ) { 
+      push @removed_relationships, $k;
+      message("Deleted relationship: $k... \n",1);
+
+      $db_relationships{$k}->delete();
+      print STDERR "gone.\n";
+        }
+    }
+  } else {
+    print STDERR "Using append option, skipping db relationship removal step."
+  }
+
 	print STDERR "\n";
 	#####################################
 	my $r_count = 0;
